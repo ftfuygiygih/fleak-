@@ -6,6 +6,7 @@ import os
 import threading
 import time
 import shutil
+import html
 from flask import Flask
 
 # --- НАСТРОЙКИ ---
@@ -113,7 +114,7 @@ def process_download(call):
     bot.delete_message(call.message.chat.id, call.message.message_id)
     status_msg = bot.send_message(call.message.chat.id, "⏳ <code>Инициализация...</code>", parse_mode="HTML")
     
-    # Запускаем в отдельном потоке, чтобы не вешать бота
+    # Запускаем загрузку в отдельном потоке
     threading.Thread(target=execute_download, args=(call.message.chat.id, status_msg.message_id, url, call.data)).start()
 
 def execute_download(chat_id, msg_id, url, format_type):
@@ -122,7 +123,7 @@ def execute_download(chat_id, msg_id, url, format_type):
     os.makedirs(download_dir, exist_ok=True)
     
     last_update = 0
-    # Прогресс-бар для Телеграма (обновляется раз в 3 секунды во избежание лимитов)
+    # Прогресс-бар для Телеграма (обновляется раз в 3 сек)
     def progress_hook(d):
         nonlocal last_update
         if d['status'] == 'downloading':
@@ -138,7 +139,13 @@ def execute_download(chat_id, msg_id, url, format_type):
         'outtmpl': f'{download_dir}/%(id)s_%(autonumber)s.%(ext)s',
         'quiet': True,
         'nocheckcertificate': True,
-        'progress_hooks': [progress_hook]
+        'progress_hooks': [progress_hook],
+        # Маскировка под реальный браузер (защита от 403 Forbidden)
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+        }
     }
     
     if is_audio:
@@ -154,23 +161,21 @@ def execute_download(chat_id, msg_id, url, format_type):
 
         bot.edit_message_text("📤 <code>Отправка файла в Telegram...</code>", chat_id, msg_id, parse_mode="HTML")
         
-        # Собираем все скачанные файлы (для поддержки фото-каруселей)
         files = [os.path.join(download_dir, f) for f in os.listdir(download_dir)]
         files.sort()
 
-        if not files: raise Exception("Файлы не найдены")
+        if not files: raise Exception("Библиотека не смогла вытянуть файл (нет доступа или пустая ссылка).")
 
         if len(files) == 1:
-            # Одиночный файл (видео или mp3)
+            # Одиночный файл
             with open(files[0], 'rb') as f:
                 if is_audio: bot.send_audio(chat_id, f)
                 elif files[0].endswith(('.mp4', '.mkv', '.webm')): bot.send_video(chat_id, f)
                 else: bot.send_photo(chat_id, f)
         else:
-            # Карусель (несколько фото)
-            media_group = []
-            open_files = []
-            for f in files[:10]: # Telegram принимает до 10 файлов в альбоме
+            # Карусель
+            media_group, open_files = [], []
+            for f in files[:10]:
                 file_obj = open(f, 'rb')
                 open_files.append(file_obj)
                 if f.endswith(('.mp4', '.webm')): media_group.append(InputMediaVideo(file_obj))
@@ -182,8 +187,18 @@ def execute_download(chat_id, msg_id, url, format_type):
         bot.delete_message(chat_id, msg_id)
 
     except Exception as e:
-        bot.edit_message_text("❌ <code>Ошибка скачивания. Возможно контент приватный.</code>", chat_id, msg_id, parse_mode="HTML")
-        print(e)
+        # Экранируем спецсимволы, чтобы лог не сломал HTML-разметку Телеграма
+        error_msg = html.escape(str(e))
+        # Обрезаем ошибку, если она слишком длинная (лимит ТГ)
+        if len(error_msg) > 800: error_msg = error_msg[:800] + "..."
+        
+        bot.edit_message_text(
+            f"❌ <b>Ошибка скачивания:</b>\n\n<code>{error_msg}</code>\n\n<i>Перешлите эту ошибку админу, если не понимаете в чем дело.</i>", 
+            chat_id, 
+            msg_id, 
+            parse_mode="HTML"
+        )
+        print(f"Ошибка: {e}")
     finally:
         # Очистка диска
         if os.path.exists(download_dir):
